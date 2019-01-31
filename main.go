@@ -1,3 +1,10 @@
+// TODO: The current solution stores the whole image in memory. Most image
+//  formats can be parsed on the fly as a byte stream. This would improve
+//  performance but has it's own challenges (like progressive JPEGs) and it
+//  would require us to write our own streaming decoder for each image type we
+//  want to support as there aren't any already existing in Go community. However
+//  the std image/* packages are well written and the logic could be extracted
+//  from there.
 package main
 
 import (
@@ -5,8 +12,8 @@ import (
 	"flag"
 	"fmt"
 	"image"
-	"image/jpeg"
-	"image/png"
+	_ "image/jpeg"
+	_ "image/png"
 	"log"
 	"net/http"
 	"net/url"
@@ -14,44 +21,39 @@ import (
 	"sync"
 )
 
-const contentTypeImageJpeg = "image/jpeg"
-const contentTypeImagePng = "image/png"
-
 type prevalentColors struct {
 	url    *url.URL
-	color1 *uint64
-	color2 *uint64
-	color3 *uint64
+	color1 *uint32
+	color2 *uint32
+	color3 *uint32
 }
 
 func main() {
-	// inputs
-	parallelism := flag.Int("parallelism", 10, "set the number of urls/images processed inFile parallel")
+	// parse inputs
+	parallelism := flag.Int("parallelism", 10, "set the number of urls/images processed in parallel")
 	outFilePath := flag.String("outfile", "output.csv", "the name/path of the output file")
 	flag.Parse()
-
 	inFilePath := flag.Arg(0)
 	if inFilePath == "" {
-		log.Panic("input file can not be empty")
+		log.Fatalf("input file can not be empty")
 	}
 
 	// open the input file
 	inFile, err := os.Open(inFilePath)
 	if err != nil {
-		log.Panicf("unable to open file: %s", inFilePath)
+		log.Fatalf("unable to open input file: %s", inFilePath)
 	}
 
 	// open the output file
 	outFile, err := os.OpenFile(*outFilePath, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
-		log.Panicf("unable to open file: %s", inFilePath)
+		log.Fatalf("unable to open output file: %s", inFilePath)
 	}
 
-	// create the input and output channels
+	// create the input/output channels and wait group
 	urlsToProcessChan := make(chan *url.URL)
 	prevalentColorsChan := make(chan *prevalentColors)
 	wg := sync.WaitGroup{}
-	wg.Add(1)
 
 	// create parallel image readers according to parallelism input
 	for i := 0; i < *parallelism; i ++ {
@@ -59,7 +61,7 @@ func main() {
 			for u := range urlsToProcessChan {
 				i, err := readImageFromURL(u)
 				if err != nil {
-					log.Panic(err)
+					log.Fatal(err)
 				}
 
 				c1, c2, c3 := getThreeMostPrevalentColorsInImage(i)
@@ -73,26 +75,8 @@ func main() {
 		}()
 	}
 
-	// read the input file and process the urls in separate goroutine
+	// write the output file in a separate goroutine
 	go func() {
-		scanner := bufio.NewScanner(inFile)
-		for scanner.Scan() {
-			in := scanner.Text()
-			u, err := url.Parse(in)
-			if err != nil {
-				log.Panicf("input is not an URL: %s", in)
-			}
-			urlsToProcessChan <- u
-			wg.Add(1)
-		}
-		close(urlsToProcessChan)
-		wg.Done()
-	}()
-
-	// write inFile a separate goroutine
-	go func() {
-		// TODO: Missing specification on what to do with 0, 1, 2 color images
-		// representing as - for now
 		for p := range prevalentColorsChan {
 			var c1, c2, c3 string
 			if p.color1 != nil {
@@ -111,52 +95,53 @@ func main() {
 		}
 	}()
 
+	// read the input file and process the urls in separate goroutine
+	scanner := bufio.NewScanner(inFile)
+	for scanner.Scan() {
+		in := scanner.Text()
+		u, err := url.Parse(in)
+		if err != nil {
+			log.Fatalf("input is not an URL: %s", in)
+		}
+		urlsToProcessChan <- u
+		wg.Add(1)
+	}
+
 	wg.Wait()
 }
 
-// only reads jpegs and pngs
+// readImageFromURL returns the image from a provided url. If the url does not
+// contain image, it can not be fetched or parsed it returned an error.
 func readImageFromURL(u *url.URL) (image.Image, error) {
 	resp, err := http.Get(u.String())
 	if err != nil {
-		log.Panicf("unable to reach url: %s, err: %v", u, err)
+		return nil, fmt.Errorf("unable to reach url: %s, err: %v", u, err)
 	}
 
-	switch contentType := resp.Header.Get("Content-Type"); contentType {
-	case contentTypeImageJpeg:
-		i, err := jpeg.Decode(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("unable to decode body from url: %s as jpeg, err: %v", u, err)
-		}
-
-		return i, nil
-	case contentTypeImagePng:
-		i, err := png.Decode(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("unable to decode body from url: %s as png, err: %v", u, err)
-		}
-
-		return i, nil
-	default:
-		return nil, fmt.Errorf("invalid content type: %s on url: %s", u, contentType)
-	}
+	i, _, err := image.Decode(resp.Body)
+	return i, err
 }
 
-func getThreeMostPrevalentColorsInImage(i image.Image) (*uint64, *uint64, *uint64) {
-	colors := map[uint64]uint64{}
+// getThreeMostPrevalentColorsInImage iterates over each pixel in the image to
+// determine the three most prevalent colors. Since the output should range from
+// #000000 to #ffffff we represent primary colors as uint8 which means in some
+// cases this can be lossy.
+func getThreeMostPrevalentColorsInImage(i image.Image) (*uint32, *uint32, *uint32) {
+	// map of color to number of its occurrences in the image
+	colors := map[uint32]uint64{}
 	bounds := i.Bounds()
 	for x := bounds.Min.X; x < bounds.Max.X; x++ {
 		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 			r, g, b, _ := i.At(x, y).RGBA()
 			// revert the precomputation done by the library to represent the
-			// colors as uint8, then do bit shifts to represent the color as int64.
-			c := uint64(r)>>8<<16 + uint64(g)>>8<<8 + uint64(b)>>8
+			// primary colors as uint8, then do bit shifts to represent the
+			// resulting color as uint32.
+			c := r>>8<<16 + g>>8<<8 + b>>8
 			colors[c] = colors[c] + 1
 		}
 	}
 
-	// this can be optimized by computing the values as we iterate the loop above
-	// will increase performance for colorful images
-	var c1, c2, c3 *uint64
+	var c1, c2, c3 *uint32
 	var n1, n2, n3 uint64
 	for c, n := range colors {
 		cc := c
