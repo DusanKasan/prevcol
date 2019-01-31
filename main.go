@@ -1,10 +1,3 @@
-// TODO: The current solution stores the whole image in memory. Most image
-//  formats can be parsed on the fly as a byte stream. This would improve
-//  performance but has it's own challenges (like progressive JPEGs) and it
-//  would require us to write our own streaming decoder for each image type we
-//  want to support as there aren't any already existing in Go community. However
-//  the std image/* packages are well written and the logic could be extracted
-//  from there.
 package main
 
 import (
@@ -29,7 +22,7 @@ type prevalentColors struct {
 
 func main() {
 	// parse inputs
-	parallelism := flag.Int("parallelism", 10, "set the number of urls/images processed in parallel")
+	concurrency := flag.Int("concurrency", 10, "set the number of urls/images processed concurrently")
 	outFilePath := flag.String("outfile", "output.csv", "the name/path of the output file")
 	flag.Parse()
 	inFilePath := flag.Arg(0)
@@ -54,8 +47,8 @@ func main() {
 	prevalentColorsChan := make(chan *prevalentColors)
 	wg := sync.WaitGroup{}
 
-	// create parallel image readers according to parallelism input
-	for i := 0; i < *parallelism; i ++ {
+	// create parallel image readers according to concurrency input
+	for i := 0; i < *concurrency; i ++ {
 		go func() {
 			for url := range urlsToProcessChan {
 				i, err := readImageFromURL(url)
@@ -122,9 +115,12 @@ func readImageFromURL(url string) (image.Image, error) {
 // #000000 to #ffffff we represent primary colors as uint8 which means in some
 // cases this can be lossy.
 func getThreeMostPrevalentColorsInImage(i image.Image) (*uint32, *uint32, *uint32) {
+	var c1, c2, c3 *uint32
+	var n1, n2, n3 uint64
+
 	// map of color to number of its occurrences in the image
-	colors := map[uint32]uint64{}
 	bounds := i.Bounds()
+	colors := make(map[uint32]uint64, bounds.Dx()*bounds.Dy())
 	for x := bounds.Min.X; x < bounds.Max.X; x++ {
 		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 			r, g, b, _ := i.At(x, y).RGBA()
@@ -137,8 +133,6 @@ func getThreeMostPrevalentColorsInImage(i image.Image) (*uint32, *uint32, *uint3
 		}
 	}
 
-	var c1, c2, c3 *uint32
-	var n1, n2, n3 uint64
 	for c, n := range colors {
 		cc := c
 		switch {
