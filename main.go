@@ -16,13 +16,12 @@ import (
 	_ "image/png"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"sync"
 )
 
 type prevalentColors struct {
-	url    *url.URL
+	url    string
 	color1 *uint32
 	color2 *uint32
 	color3 *uint32
@@ -51,22 +50,22 @@ func main() {
 	}
 
 	// create the input/output channels and wait group
-	urlsToProcessChan := make(chan *url.URL)
+	urlsToProcessChan := make(chan string)
 	prevalentColorsChan := make(chan *prevalentColors)
 	wg := sync.WaitGroup{}
 
 	// create parallel image readers according to parallelism input
 	for i := 0; i < *parallelism; i ++ {
 		go func() {
-			for u := range urlsToProcessChan {
-				i, err := readImageFromURL(u)
+			for url := range urlsToProcessChan {
+				i, err := readImageFromURL(url)
 				if err != nil {
-					log.Fatal(err)
+					log.Fatalf("unable to read image from url: %s, err: %v", url, err)
 				}
 
 				c1, c2, c3 := getThreeMostPrevalentColorsInImage(i)
 				prevalentColorsChan <- &prevalentColors{
-					url:    u,
+					url:    url,
 					color1: c1,
 					color2: c2,
 					color3: c3,
@@ -88,7 +87,7 @@ func main() {
 			if p.color3 != nil {
 				c3 = fmt.Sprintf("#%06x", *p.color3)
 			}
-			out := fmt.Sprintf("%s, %s, %s, %s\n", p.url.String(), c1, c2, c3)
+			out := fmt.Sprintf("%s, %s, %s, %s\n", p.url, c1, c2, c3)
 			fmt.Fprint(outFile, out)
 			log.Print(out)
 			wg.Done()
@@ -98,12 +97,7 @@ func main() {
 	// read the input file and process the urls in separate goroutine
 	scanner := bufio.NewScanner(inFile)
 	for scanner.Scan() {
-		in := scanner.Text()
-		u, err := url.Parse(in)
-		if err != nil {
-			log.Fatalf("input is not an URL: %s", in)
-		}
-		urlsToProcessChan <- u
+		urlsToProcessChan <- scanner.Text()
 		wg.Add(1)
 	}
 
@@ -112,13 +106,14 @@ func main() {
 
 // readImageFromURL returns the image from a provided url. If the url does not
 // contain image, it can not be fetched or parsed it returned an error.
-func readImageFromURL(u *url.URL) (image.Image, error) {
-	resp, err := http.Get(u.String())
+func readImageFromURL(url string) (image.Image, error) {
+	resp, err := http.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("unable to reach url: %s, err: %v", u, err)
+		return nil, fmt.Errorf("unable to reach url: %s, err: %v", url, err)
 	}
 
 	i, _, err := image.Decode(resp.Body)
+	resp.Body.Close()
 	return i, err
 }
 
@@ -135,7 +130,8 @@ func getThreeMostPrevalentColorsInImage(i image.Image) (*uint32, *uint32, *uint3
 			r, g, b, _ := i.At(x, y).RGBA()
 			// revert the precomputation done by the library to represent the
 			// primary colors as uint8, then do bit shifts to represent the
-			// resulting color as uint32.
+			// resulting color as uint32. This is done here manually to avoid
+			// the overhead of calling `color.RGBAModel` and casting to `color.RGBA`.
 			c := r>>8<<16 + g>>8<<8 + b>>8
 			colors[c] = colors[c] + 1
 		}
